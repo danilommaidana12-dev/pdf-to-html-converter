@@ -1,0 +1,20 @@
+# PDF2HTMLBook
+
+[project]
+name = "pdf2htmlbook"
+version = "0.1.0"
+description = "Convertidor de PDF a HTML limpio con OCR, layout y vista previa"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "Flask>=3.0",
+    "Jinja2>=3.1",
+    "Pillow>=10.0",
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+    "pymupdf>=1.24.0",
+    "pytesseract>=0.3.10",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

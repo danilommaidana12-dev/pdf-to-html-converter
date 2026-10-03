@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+from multiprocessing import get_context
+from pathlib import Path
+from typing import Any, Dict, List
+
+try:
+    import pymupdf as pymupdf
+except ImportError:  # pragma: no cover
+    try:
+        import fitz as pymupdf
+    except ImportError:  # pragma: no cover
+        pymupdf = None
+
+try:
+    import pytesseract
+except ImportError:  # pragma: no cover
+    pytesseract = None
+
+from .layout import detect_columns, detect_pdf_type, merge_paragraphs, order_blocks_for_reading
+from .models import BookPage, ConversionOptions, LayoutBlock, TextSpan
+from .utils import warn_once
+
+
+def detect_ocr_needed(pdf_path: Path, ocr_mode: str) -> bool:
+    if ocr_mode == "siempre":
+        return True
+    if ocr_mode == "no":
+        return False
+    if pymupdf is None:
+        return False
+    try:
+        doc = pymupdf.open(pdf_path)
+        total_text = 0
+        for page in doc:
+            total_text += len(page.get_text("text") or "")
+        doc.close()
+        return total_text < 400
+    except Exception:
+        return True
+
+
+def extract_text_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
+    if pymupdf is None:
+        raise RuntimeError("PyMuPDF / fitz no está instalado")
+    doc = pymupdf.open(pdf_path)
+    items: List[Dict[str, Any]] = []
+    for page_index, page in enumerate(doc, start=1):
+        for block in page.get_text("blocks"):
+            if len(block) < 6:
+                continue
+            x0, y0, x1, y1, text, *_ = block
+            txt = (text or "").strip()
+            if not txt:
+                continue
+            items.append({
+                "page": page_index,
+                "x0": float(x0),
+                "y0": float(y0),
+                "x1": float(x1),
+                "y1": float(y1),
+                "text": txt,
+            })
+    doc.close()
+    return items
+
+
+def try_ocr_page(image_path: str, idioma: str = "es+en") -> str:
+    if pytesseract is None:
+        warn_once("tesseract_missing", "Tesseract no está instalado o no está disponible; el proceso continúa sin OCR.")
+        return ""
+    try:
+        from PIL import Image
+        return pytesseract.image_to_string(Image.open(image_path), lang=idioma) or ""
+    except Exception:
+        warn_once("ocr_fail", "OCR falló en una página; se ignora y se continúa.")
+        return ""
+
+
+class BookConverter:
+    def __init__(self, options: ConversionOptions):
+        self.options = options
+
+    def process(self, pdf_path: str | Path) -> List[BookPage]:
+        pdf_path = Path(pdf_path)
+        if not pdf_path.exists():
+            raise FileNotFoundError(pdf_path)
+
+        if self.options.procesos > 1:
+            ctx = get_context("spawn")
+            pages = []
+            with ctx.Pool(processes=self.options.procesos) as pool:
+                job_list = [(str(pdf_path), index) for index in range(1, self._page_count(pdf_path) + 1)]
+                results = pool.map(self._process_one_page, job_list)
+                pages.extend(r for r in results if r is not None)
+            return pages
+
+        pages: List[BookPage] = []
+        if pymupdf is None:
+            raise RuntimeError("PyMuPDF / fitz no está instalado")
+        doc = pymupdf.open(pdf_path)
+        for index, page in enumerate(doc, start=1):
+            result = self._process_one_page((str(pdf_path), index))
+            if result is not None:
+                pages.append(result)
+        doc.close()
+        return pages
+
+    def _page_count(self, pdf_path: Path) -> int:
+        if pymupdf is None:
+            return 1
+        doc = pymupdf.open(pdf_path)
+        count = doc.page_count
+        doc.close()
+        return count
+
+    def _process_one_page(self, arg):
+        pdf_path_str, page_index = arg
+        pdf_path = Path(pdf_path_str)
+        if pymupdf is None:
+            return None
+
+        doc = pymupdf.open(pdf_path)
+        if page_index > doc.page_count:
+            doc.close()
+            return None
+
+        page = doc[page_index - 1]
+        width, height = float(page.rect.width), float(page.rect.height)
+        text_blocks = page.get_text("blocks")
+        spans: List[TextSpan] = []
+        for block in text_blocks:
+            if len(block) < 6:
+                continue
+            x0, y0, x1, y1, text, *_ = block
+            txt = (text or "").strip()
+            if not txt:
+                continue
+            spans.append(TextSpan(
+                x0=float(x0),
+                y0=float(y0),
+                x1=float(x1),
+                y1=float(y1),
+                text=txt,
+                page=page_index,
+            ))
+
+        page_type = detect_pdf_type(sum(len(s.text) for s in spans), 0.0)
+        cols = detect_columns(spans, width, height)
+        paragraphs = merge_paragraphs(spans)
+        blocks = [
+            LayoutBlock(
+                kind="text",
+                rect=(0.0, 0.0, width, height),
+                items=spans,
+                metadata={"columns": cols, "paragraphs": paragraphs},
+            )
+        ]
+
+        result = BookPage(page_number=page_index, page_type=page_type, text_spans=spans, width=width, height=height)
+        result.layout_blocks = order_blocks_for_reading(blocks)
+        doc.close()
+        return result
